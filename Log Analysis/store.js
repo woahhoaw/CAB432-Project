@@ -5,10 +5,7 @@ const { v4: uuidv4 } = require('uuid');
 
 const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
-const {
-  DynamoDBDocumentClient, PutCommand, GetCommand, QueryCommand,
-  DeleteCommand, BatchWriteCommand, ScanCommand
-} = require('@aws-sdk/lib-dynamodb');
+const { DynamoDBDocumentClient, PutCommand, GetCommand, QueryCommand, DeleteCommand, BatchWriteCommand, UpdateCommand, ScanCommand } = require('@aws-sdk/lib-dynamodb');
 const { SSMClient, GetParameterCommand } = require('@aws-sdk/client-ssm');
 
 const REGION = process.env.AWS_REGION || 'ap-southeast-2';
@@ -123,7 +120,7 @@ async function ensureLocalLogCopy(logId) {
 
 async function createJob(logId) {
   const { DDB_JOBS } = await cfg();
-  const id = uuidv4();
+  const id = require('uuid').v4();
   const job = { jobId: id, logId, status: 'queued', createdAt: new Date().toISOString() };
   await ddb.send(new PutCommand({ TableName: DDB_JOBS, Item: job }));
   return job;
@@ -131,27 +128,41 @@ async function createJob(logId) {
 
 async function startJob(jobId) {
   const { DDB_JOBS } = await cfg();
-  await ddb.send(new PutCommand({
+  await ddb.send(new UpdateCommand({
     TableName: DDB_JOBS,
-    Item: { jobId, status: 'running', startedAt: new Date().toISOString() },
+    Key: { jobId },
+    UpdateExpression: 'SET #st = :st, startedAt = :t',
+    ExpressionAttributeNames: { '#st': 'status' },
+    ExpressionAttributeValues: { ':st': 'running', ':t': new Date().toISOString() },
     ConditionExpression: 'attribute_exists(jobId)'
   }));
 }
 
 async function finishJob(jobId) {
   const { DDB_JOBS } = await cfg();
-  await ddb.send(new PutCommand({
+  await ddb.send(new UpdateCommand({
     TableName: DDB_JOBS,
-    Item: { jobId, status: 'done', finishedAt: new Date().toISOString() },
+    Key: { jobId },
+    UpdateExpression: 'SET #st = :st, finishedAt = :t',
+    ExpressionAttributeNames: { '#st': 'status' },
+    ExpressionAttributeValues: { ':st': 'done', ':t': new Date().toISOString() },
     ConditionExpression: 'attribute_exists(jobId)'
   }));
 }
 
 async function failJob(jobId, message) {
   const { DDB_JOBS } = await cfg();
-  await ddb.send(new PutCommand({
+  await ddb.send(new UpdateCommand({
     TableName: DDB_JOBS,
-    Item: { jobId, status: 'error', error: message, finishedAt: new Date().toISOString() }
+    Key: { jobId },
+    UpdateExpression: 'SET #st = :st, error = :msg, finishedAt = :t',
+    ExpressionAttributeNames: { '#st': 'status' },
+    ExpressionAttributeValues: {
+      ':st': 'error',
+      ':msg': String(message || ''),
+      ':t': new Date().toISOString()
+    },
+    ConditionExpression: 'attribute_exists(jobId)'
   }));
 }
 
