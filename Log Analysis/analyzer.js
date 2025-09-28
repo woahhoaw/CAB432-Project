@@ -36,6 +36,19 @@ function clfToISO(rawTs) {
   return d.toISOString(); // store as UTC ISO
 }
 
+function parseClfToIso(rawTs) {
+  // e.g. "28/Sep/2025:12:34:56 +1000"
+  const m = rawTs.match(/^(\d{2})\/([A-Za-z]{3})\/(\d{4}):(\d{2}):(\d{2}):(\d{2}) ([+\-]\d{4})$/);
+  if (!m) return null;
+  const [ , dd, mon, yyyy, HH, MM, SS, zone ] = m;
+  const month = {Jan:'01',Feb:'02',Mar:'03',Apr:'04',May:'05',Jun:'06',Jul:'07',Aug:'08',Sep:'09',Oct:'10',Nov:'11',Dec:'12'}[mon];
+  if (!month) return null;
+  const z = zone.replace(/(\+|\-)(\d{2})(\d{2})/, '$1$2:$3'); // +1000 -> +10:00
+  const isoLocal = `${yyyy}-${month}-${dd}T${HH}:${MM}:${SS}${z}`;
+  const d = new Date(isoLocal);
+  return isNaN(d.getTime()) ? null : d.toISOString(); // normalize to UTC ISO
+}
+
 // helper to grab the top N items from a frequency map
 function topN(obj, n) {
   return Object.entries(obj)

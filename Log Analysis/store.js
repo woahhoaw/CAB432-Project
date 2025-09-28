@@ -180,30 +180,50 @@ async function getJob(jobId) {
 
 async function insertEvents(jobId, events) {
   const { DDB_JOBS, DDB_EVENTS } = await cfg();
+  const { GetCommand, BatchWriteCommand } = require('@aws-sdk/lib-dynamodb');
+
+  // Resolve logId from job
   const jres = await ddb.send(new GetCommand({ TableName: DDB_JOBS, Key: { jobId } }));
   if (!jres.Item) throw new Error('Job not found');
   const logId = jres.Item.logId;
 
-  // Build PutRequests with eventId (SK) = ts#seq
-  let seq = 0;
-  const requests = events.map((e) => {
-    const eventId = `${e.ts}#${String(seq++).padStart(6, '0')}`; // e.ts is ISO
-    return {
+  // Build PutRequests using eventTs (SK) — MUST be a non-empty string
+  const requests = [];
+  for (const e of events) {
+    const ts = (typeof e.ts === 'string' && e.ts.length) ? e.ts : null;
+    if (!ts) {
+      console.warn('[events] skipping event with missing ts', e);
+      continue;
+    }
+    requests.push({
       PutRequest: {
         Item: {
-          logId,           // PK
-          eventId,         // SK (matches table schema)
-          eventTs: e.ts,   // keep original ISO as attribute
-          ...e             // ip, method, path, status, bytes
+          logId,        // PK
+          eventTs: ts,  // SK (matches table schema)
+          ip: e.ip,
+          method: e.method,
+          path: e.path,
+          status: e.status,
+          bytes: e.bytes
         }
       }
-    };
-  });
+    });
+  }
 
-  // BatchWrite in chunks of 25
+  if (requests.length === 0) {
+    console.warn('[events] no valid events to write');
+    return;
+  }
+
   const chunks = chunk(requests, 25);
   for (const batch of chunks) {
-    await ddb.send(new BatchWriteCommand({ RequestItems: { [DDB_EVENTS]: batch } }));
+    try {
+      await ddb.send(new BatchWriteCommand({ RequestItems: { [DDB_EVENTS]: batch } }));
+    } catch (err) {
+      console.error('[events] batch write failed. Sample item:', batch[0]);
+      console.error('[events] table:', DDB_EVENTS);
+      throw err;
+    }
   }
 }
 
@@ -227,15 +247,23 @@ async function getSummary(logId) {
 
 async function queryEvents(logId, opts) {
   const { DDB_EVENTS } = await cfg();
-  const { page = 1, limit = 100, ip = null, status = null, timeFrom = null, timeTo = null, sort = 'eventId' } = opts;
+  const { page = 1, limit = 100, ip = null, status = null, timeFrom = null, timeTo = null, sort = 'eventTs' } = opts;
 
-  // Build SK range on eventId using ISO ranges
-  // We suffix '#' to make room for "#000000" sequence; use '\uffff' to cap the upper bound.
-  const startId = (timeFrom ? `${timeFrom}#` : '0000-00-00T00:00:00.000Z#');
-  const endId   = (timeTo   ? `${timeTo}#\uffff` : '9999-12-31T23:59:59.999Z#\uffff');
+  // Build range on eventTs (ISO strings)
+  const KeyConditionExpressionParts = ['logId = :id'];
+  const ExpressionAttributeValues = { ':id': logId };
 
-  const KeyConditionExpression = 'logId = :id AND eventId BETWEEN :start AND :end';
-  const ExpressionAttributeValues = { ':id': logId, ':start': startId, ':end': endId };
+  if (timeFrom && timeTo) {
+    KeyConditionExpressionParts.push('eventTs BETWEEN :from AND :to');
+    ExpressionAttributeValues[':from'] = timeFrom;
+    ExpressionAttributeValues[':to'] = timeTo;
+  } else if (timeFrom) {
+    KeyConditionExpressionParts.push('eventTs >= :from');
+    ExpressionAttributeValues[':from'] = timeFrom;
+  } else if (timeTo) {
+    KeyConditionExpressionParts.push('eventTs <= :to');
+    ExpressionAttributeValues[':to'] = timeTo;
+  }
 
   const need = page * limit;
   let items = [], lastKey;
@@ -243,9 +271,9 @@ async function queryEvents(logId, opts) {
   while (items.length < need) {
     const res = await ddb.send(new QueryCommand({
       TableName: DDB_EVENTS,
-      KeyConditionExpression,
+      KeyConditionExpression: KeyConditionExpressionParts.join(' AND '),
       ExpressionAttributeValues,
-      ScanIndexForward: !String(sort).startsWith('-'), // asc by default
+      ScanIndexForward: !String(sort).startsWith('-'), // asc by default; desc if sort = -eventTs
       ExclusiveStartKey: lastKey
     }));
     items = items.concat(res.Items || []);
@@ -253,7 +281,6 @@ async function queryEvents(logId, opts) {
     if (!lastKey) break;
   }
 
-  // Optional filters
   if (ip) items = items.filter(e => e.ip === ip);
   if (status !== null) items = items.filter(e => e.status === status);
 
@@ -261,6 +288,7 @@ async function queryEvents(logId, opts) {
   const slice = items.slice((page - 1) * limit, (page - 1) * limit + limit);
   return { page, limit, total, items: slice };
 }
+
 
 async function deleteLog(logId) {
   const { BUCKET, DDB_LOGS, DDB_SUMMARIES, DDB_EVENTS } = await cfg();
