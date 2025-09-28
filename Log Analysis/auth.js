@@ -1,45 +1,120 @@
+// auth.js
 const jwt = require('jsonwebtoken');
 const jwkToPem = require('jwk-to-pem');
-const axios = require('axios');
 
-let pems = null;
 
-async function initCognito({ region = 'ap-southeast-2', userPoolId }) {
-  const url = `https://cognito-idp.${region}.amazonaws.com/${userPoolId}/.well-known/jwks.json`;
-  const { data } = await axios.get(url);
-  pems = {};
-  data.keys.forEach(k => { pems[k.kid] = jwkToPem(k); });
+
+let JWKS = null;
+let JWKS_URL = null;
+let ISSUER = null;
+let EXPECTED_AUD = null; // optional clientId
+
+/**
+ * Call this once at startup.
+ *   initCognito({ userPoolId: 'ap-southeast-2_XXXX', region: 'ap-southeast-2', clientId?: 'xxx' })
+ */
+async function initCognito({ userPoolId, region = process.env.AWS_REGION || 'ap-southeast-2', clientId } = {}) {
+  if (!userPoolId) throw new Error('initCognito: userPoolId is required');
+  JWKS_URL = `https://cognito-idp.${region}.amazonaws.com/${userPoolId}/.well-known/jwks.json`;
+  ISSUER = `https://cognito-idp.${region}.amazonaws.com/${userPoolId}`;
+  EXPECTED_AUD = clientId || process.env.COGNITO_CLIENT_ID || undefined;
+  await refreshJwks();
 }
 
-function authMiddleware(req, res, next) {
-  const header = req.headers['authorization'] || '';
-  const [type, token] = header.split(' ');
-  if (type !== 'Bearer' || !token) return res.status(401).json({ message: 'Missing token' });
+async function refreshJwks() {
+  const res = await fetch(JWKS_URL);
+  if (!res.ok) throw new Error(`Failed to fetch JWKS: ${res.status}`);
+  const data = await res.json();
+  JWKS = {};
+  for (const k of data.keys || []) {
+    JWKS[k.kid] = jwkToPem(k);
+  }
+}
 
-  const decoded = jwt.decode(token, { complete: true });
-  const pem = decoded && pems && pems[decoded.header.kid];
-  if (!pem) return res.status(401).json({ message: 'Invalid token' });
+// Verify a Cognito JWT using the JWKS (RS256)
+function verifyCognitoJwt(token) {
+  return new Promise((resolve, reject) => {
+    const decoded = jwt.decode(token, { complete: true });
+    if (!decoded || !decoded.header || !decoded.header.kid) {
+      return reject(new Error('Invalid JWT header'));
+    }
+    const { kid, alg } = decoded.header;
+    if (alg !== 'RS256') return reject(new Error(`Unexpected alg: ${alg}`));
 
-  jwt.verify(token, pem, { algorithms: ['RS256'] }, (err, claims) => {
-    if (err) return res.status(401).json({ message: 'Invalid token' });
-    // Cognito user name and groups
-    req.user = {
-      sub: claims['cognito:username'] || claims['username'] || claims['sub'],
-      email: claims.email,
-      groups: claims['cognito:groups'] || []
+    let pem = JWKS && JWKS[kid];
+    const verifyWithPem = (thePem) => {
+      const opts = {
+        algorithms: ['RS256'],
+        issuer: ISSUER,
+      };
+      // Only enforce audience if we know the client id
+      if (EXPECTED_AUD) opts.audience = EXPECTED_AUD;
+
+      jwt.verify(token, thePem, opts, (err, payload) => {
+        if (err) return reject(err);
+        // Optional: reject if token_use isn’t id/access
+        if (payload.token_use && !['id', 'access'].includes(payload.token_use)) {
+          return reject(new Error(`Unexpected token_use: ${payload.token_use}`));
+        }
+        resolve(payload);
+      });
     };
-    
-    req.user.role = req.user.groups.includes('admin') ? 'admin' : 'analyst';
-    next();
+
+    if (pem) return verifyWithPem(pem);
+
+    // JWKS might have rotated; refresh once
+    refreshJwks()
+      .then(() => {
+        pem = JWKS && JWKS[kid];
+        if (!pem) throw new Error('kid not found after JWKS refresh');
+        verifyWithPem(pem);
+      })
+      .catch(reject);
   });
 }
 
-function requireRole(role) {
-  return (req, _res, next) => {
-    if (!req.user) return next(new Error('Unauthenticated'));
-    if (role === 'admin' && !req.user.groups.includes('admin')) {
-      return _res.status(403).json({ message: 'Forbidden' });
+// Middleware: Bearer <JWT>
+async function authMiddleware(req, res, next) {
+  try {
+    const header = req.headers['authorization'] || '';
+    const [type, token] = header.split(' ');
+    if (type !== 'Bearer' || !token) {
+      return res.status(401).json({ message: 'Missing or invalid Authorization header' });
     }
+
+    try {
+      // Try Cognito verification first
+      if (ISSUER && JWKS_URL) {
+        req.user = await verifyCognitoJwt(token);
+        return next();
+      }
+      throw new Error('Cognito not configured');
+    } catch (e) {
+      // Fallback to local HMAC (dev only)
+      const secret = process.env.JWT_SECRET;
+      if (!secret) throw e;
+      req.user = jwt.verify(token, secret);
+      return next();
+    }
+  } catch (err) {
+    // Normalize 401s
+    return res.status(401).json({ message: 'Invalid token' });
+  }
+}
+
+function requireRole(role) {
+  // For Cognito, role can come from groups or custom claims; adjust as needed.
+  return (req, res, next) => {
+    // Example checks:
+    // - Cognito groups in `cognito:groups`
+    // - Custom claim `custom:role`
+    // - Local dev token { role: 'admin' }
+    const u = req.user || {};
+    const groups = u['cognito:groups'] || [];
+    const customRole = u['custom:role'] || u.role;
+
+    const isAllowed = customRole === role || (Array.isArray(groups) && groups.includes(role));
+    if (!isAllowed) return res.status(403).json({ message: 'Forbidden' });
     next();
   };
 }
