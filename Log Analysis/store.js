@@ -193,12 +193,29 @@ async function insertEvents(jobId, events) {
   const { DDB_JOBS, DDB_EVENTS } = await cfg();
   const { GetCommand, BatchWriteCommand } = require('@aws-sdk/lib-dynamodb');
 
-  // Resolve logId from job
+  // Resolve logId from job (logId must be present; we use UpdateCommand for status transitions now)
   const jres = await ddb.send(new GetCommand({ TableName: DDB_JOBS, Key: { jobId } }));
-  if (!jres.Item) throw new Error('Job not found');
+  if (!jres.Item || !jres.Item.logId) throw new Error('Job not found or missing logId on job');
   const logId = jres.Item.logId;
 
-  // Build PutRequests using eventTs (SK) — MUST be a non-empty string
+  // De-dup same-second timestamps by adding incremental milliseconds
+  const perSecondCounts = new Map(); // baseSecond -> count
+
+  function uniqueIso(tsIso) {
+    // tsIso is a full ISO string (UTC), e.g. 2025-08-27T12:00:01.000Z
+    // Use the second portion as the key (strip milliseconds)
+    const baseSecond = tsIso.replace(/\.\d{3}Z$/, '.000Z');
+    const c = perSecondCounts.get(baseSecond) || 0;
+    perSecondCounts.set(baseSecond, c + 1);
+    if (c === 0) {
+      return baseSecond; // first occurrence stays .000Z
+    }
+    // add c ms to base
+    const d = new Date(baseSecond);
+    d.setUTMilliseconds(d.getUTCMilliseconds() + c);
+    return d.toISOString();
+  }
+
   const requests = [];
   for (const e of events) {
     const ts = (typeof e.ts === 'string' && e.ts.length) ? e.ts : null;
@@ -206,11 +223,13 @@ async function insertEvents(jobId, events) {
       console.warn('[events] skipping event with missing ts', e);
       continue;
     }
+    const uniqueTs = uniqueIso(ts);
+
     requests.push({
       PutRequest: {
         Item: {
-          logId,        // PK
-          eventTs: ts,  // SK (matches table schema)
+          logId,          // PK
+          eventTs: uniqueTs, // SK (now unique even when many events in same second)
           ip: e.ip,
           method: e.method,
           path: e.path,
