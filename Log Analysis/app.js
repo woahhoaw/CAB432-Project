@@ -47,7 +47,7 @@ app.get('/logs/upload-url', authMiddleware, async (_req, res) => {
   }
 });
 
-// After client PUTs to S3, register metadata
+// After client PUTs to S3, register metadata + auto-analyze
 app.post('/logs/register-upload', authMiddleware, async (req, res) => {
   try {
     const { logId, key, filename, size } = req.body || {};
@@ -55,9 +55,24 @@ app.post('/logs/register-upload', authMiddleware, async (req, res) => {
       return res.status(400).json({ message: 'Missing fields: logId/key/filename' });
     }
 
-    // If it’s already present, this is idempotent (store side upserts).
+    // upsert log metadata
     await store.registerUploadedMetadata(req.user.sub, { logId, key, filename, size });
-    res.json({ ok: true, logId });
+
+    // queue analyze job immediately (fire-and-forget)
+    const job = await store.createJob(logId);
+    (async () => {
+      try {
+        await store.startJob(job.jobId);
+        const localPath = await store.ensureLocalLogCopy(logId);
+        await analyzeLogFile(localPath, job.jobId, store); // this writes events + summary
+      } catch (e) {
+        console.error('auto-analyze error', e);
+        await store.failJob(job.jobId, e.message);
+      }
+    })();
+
+    // return quickly; summary will appear shortly
+    res.json({ ok: true, logId, jobId: job.jobId, status: 'queued' });
   } catch (err) {
     console.error('POST /logs/register-upload error', err);
     res.status(500).json({ message: 'Register failed' });
