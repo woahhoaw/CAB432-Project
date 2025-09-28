@@ -155,6 +155,27 @@ async function failJob(jobId, message) {
   }));
 }
 
+async function findJobsByLogId(logId, limit = 5) {
+  const { DDB_JOBS } = await cfg();
+  const { ScanCommand } = require('@aws-sdk/lib-dynamodb');
+  const res = await ddb.send(new ScanCommand({
+    TableName: DDB_JOBS,
+    FilterExpression: '#lid = :lid',
+    ExpressionAttributeNames: { '#lid': 'logId' },
+    ExpressionAttributeValues: { ':lid': logId },
+    Limit: limit
+  }));
+  // latest first (by createdAt desc if present)
+  return (res.Items || []).sort((a,b) => (b.createdAt||'').localeCompare(a.createdAt||''));
+}
+
+async function getJob(jobId) {
+  const { DDB_JOBS } = await cfg();
+  const { GetCommand } = require('@aws-sdk/lib-dynamodb');
+  const res = await ddb.send(new GetCommand({ TableName: DDB_JOBS, Key: { jobId } }));
+  return res.Item || null;
+}
+
 /* --------- Events & Summaries --------- */
 
 async function insertEvents(jobId, events) {
@@ -294,6 +315,6 @@ module.exports = {
   saveLogFile, getLog, ensureLocalLogCopy,
   createJob, startJob, finishJob, failJob,
   insertEvents, saveSummary, getSummary, queryEvents, deleteLog,
-  listLogs,                       // NEW
-  registerUploadedMetadata        // NEW
+  listLogs, registerUploadedMetadata,
+  findJobsByLogId, getJob           
 };

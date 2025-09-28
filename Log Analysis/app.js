@@ -60,13 +60,18 @@ app.post('/logs/register-upload', authMiddleware, async (req, res) => {
 
     // queue analyze job immediately (fire-and-forget)
     const job = await store.createJob(logId);
+    console.log(`[analyze] queued jobId=${job.jobId} for logId=${logId}`);
     (async () => {
       try {
         await store.startJob(job.jobId);
+        console.log(`[analyze] started jobId=${job.jobId}`);
         const localPath = await store.ensureLocalLogCopy(logId);
+        console.log(`[analyze] downloading S3 -> ${localPath}`);
         await analyzeLogFile(localPath, job.jobId, store); // this writes events + summary
+        console.log(`[analyze] finished jobId=${job.jobId}`);
       } catch (e) {
         console.error('auto-analyze error', e);
+        console.error('[analyze] error', e);
         await store.failJob(job.jobId, e.message);
       }
     })();
@@ -130,15 +135,49 @@ app.post('/logs/:logId/analyze', authMiddleware, async (req, res) => {
   }
 });
 
-// Get summary for a logId (used by SummaryView.jsx)
+// --- Get summary (graceful while processing) ---
 app.get('/logs/:logId/summary', authMiddleware, async (req, res) => {
   try {
-    const s = await store.getSummary(req.params.logId);
-    if (!s) return res.status(404).json({ message: 'No summary for this log' });
-    res.json(s);
+    const { logId } = req.params;
+
+    // 404 if the logId itself does not exist
+    const log = await store.getLog(logId);
+    if (!log) return res.status(404).json({ message: 'Log not found' });
+
+    const s = await store.getSummary(logId);
+    if (s) return res.json(s);
+
+    // No summary yet — report job status if any
+    const jobs = await store.findJobsByLogId(logId, 3);
+    const latest = jobs[0];
+    const status = latest?.status || 'pending';
+
+    // 202 = Accepted / Not ready yet (lets the UI poll)
+    return res.status(202).json({ message: 'Summary not ready', status, jobId: latest?.jobId || null });
   } catch (err) {
     console.error('GET /logs/:logId/summary error', err);
     res.status(500).json({ message: 'Error reading summary' });
+  }
+});
+
+// --- Get processing status for a logId ---
+app.get('/logs/:logId/status', authMiddleware, async (req, res) => {
+  try {
+    const { logId } = req.params;
+    const log = await store.getLog(logId);
+    if (!log) return res.status(404).json({ message: 'Log not found' });
+
+    const summary = await store.getSummary(logId);
+    const jobs = await store.findJobsByLogId(logId, 5);
+
+    res.json({
+      hasSummary: !!summary,
+      latestJob: jobs[0] || null,
+      jobs
+    });
+  } catch (err) {
+    console.error('GET /logs/:logId/status error', err);
+    res.status(500).json({ message: 'Could not fetch status' });
   }
 });
 
