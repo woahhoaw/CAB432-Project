@@ -2,75 +2,116 @@ const fs = require('fs');
 const crypto = require('crypto');
 const readline = require('readline');
 
-// quick regex to roughly parse Apache Common Log Format lines
-// (not perfect but handles typical CLF entries)
-const CLF = /^(\S+) \S+ \S+ \[([^\]]+)\] "(\S+) ([^"]+) (\S+)" (\d{3}) (\d+|-) "([^"]*)" "([^"]*)"$/;
+// Apache/Nginx Common Log Format (CLF) regex
+// e.g. 127.0.0.1 - - [10/Oct/2000:13:55:36 -0700] "GET /path HTTP/1.0" 200 2326 "ref" "ua"
+const CLF = /^(\S+)\s+\S+\s+\S+\s+\[([^\]]+)\]\s+"(\S+)\s+([^"]+)\s+(\S+)"\s+(\d{3})\s+(\d+|-)\s+"([^"]*)"\s+"([^"]*)"$/;
+
+// Convert CLF timestamp "10/Oct/2000:13:55:36 -0700" -> ISO 8601 "2000-10-10T20:55:36.000Z" (UTC)
+function clfToISO(rawTs) {
+  // rawTs = "dd/Mon/yyyy:HH:mm:ss Z"
+  // split tz
+  const spaceIdx = rawTs.lastIndexOf(' ');
+  const datePart = spaceIdx === -1 ? rawTs : rawTs.slice(0, spaceIdx);
+  const tzPart = spaceIdx === -1 ? '+0000' : rawTs.slice(spaceIdx + 1); // default UTC if missing
+
+  const [dd, mon, yyyy, hh, mm, ss] = datePart
+    .replaceAll('/', ':')
+    .split(':');
+
+  const monthMap = {
+    Jan:'01', Feb:'02', Mar:'03', Apr:'04', May:'05', Jun:'06',
+    Jul:'07', Aug:'08', Sep:'09', Oct:'10', Nov:'11', Dec:'12'
+  };
+  const MM = monthMap[mon];
+  if (!MM) return null;
+
+  // Normalize tz "-0700" -> "-07:00"
+  const tzNorm = /^[+-]\d{4}$/.test(tzPart)
+    ? tzPart.slice(0, 3) + ':' + tzPart.slice(3)
+    : tzPart;
+
+  const isoWithOffset = `${yyyy}-${MM}-${dd}T${hh}:${mm}:${ss}${tzNorm}`;
+  const d = new Date(isoWithOffset);
+  if (isNaN(d.getTime())) return null;
+  return d.toISOString(); // store as UTC ISO
+}
+
+// helper to grab the top N items from a frequency map
+function topN(obj, n) {
+  return Object.entries(obj)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, n)
+    .map(([key, count]) => ({ key, count }));
+}
 
 async function analyzeLogFile(filePath, jobId, store) {
-  // mark the job as started in the external store
+  // mark job started (your store enforces ConditionExpression on existing jobId)
   await store.startJob(jobId);
 
-  // create a SHA256 hasher to hash the entire file contents
   const sha = crypto.createHash('sha256');
 
-  // counters to track stats while reading
   const counters = {
-    total: 0,             // total lines read
-    statusCounts: {},     // map of status code -> count
-    ipCounts: {},         // map of IP -> count
-    pathCounts: {},       // map of URL path -> count
-    perMinute: new Map(), // map minute bucket -> count
-    eventsBatch: []       // buffer of parsed events for batch insert
+    total: 0,
+    statusCounts: {}, // { '200': 123, '404': 5, ... }
+    ipCounts: {},     // { '1.2.3.4': 10, ... }
+    pathCounts: {},   // { '/': 10, '/login': 5, ... }
+    perMinute: new Map(), // Map<"YYYY-MM-DDTHH:MM", count>
+    eventsBatch: []
   };
 
-  // create a streaming readline interface for the log file
+  // Stream the file line-by-line
   const rl = readline.createInterface({ input: fs.createReadStream(filePath) });
+
   for await (const line of rl) {
-    sha.update(line);      // update running file hash
-    counters.total++;      // increment total line count
+    // hash the whole raw file (including newlines)
+    sha.update(line);
+    sha.update('\n');
 
-    // try to parse the log line with regex
+    counters.total++;
+
     const m = CLF.exec(line);
-    if (!m) continue; // skip if line doesn’t match
+    if (!m) continue;
 
-    // destructure fields from regex groups
-    const [, ip, rawTs, method, path, proto, statusStr, bytesStr] = m;
+    const [, ip, rawTs, method, path, proto, statusStr, bytesStr/*, referer, userAgent*/] = m;
     const status = Number(statusStr);
     const bytes = bytesStr === '-' ? 0 : Number(bytesStr);
 
-    // increment status code count
+    // Convert CLF time -> ISO for correct ordering in DynamoDB (eventTs RANGE key)
+    const iso = clfToISO(rawTs);
+    if (!iso) continue; // skip unparsable timestamps
+
+    // update aggregates
     counters.statusCounts[statusStr] = (counters.statusCounts[statusStr] || 0) + 1;
-    // increment IP count
     counters.ipCounts[ip] = (counters.ipCounts[ip] || 0) + 1;
-    // increment path count
     counters.pathCounts[path] = (counters.pathCounts[path] || 0) + 1;
 
-    // group events by minute (just split timestamp text up to hours+minutes)
-    const tsMinute = rawTs.split(':').slice(0, 2).join(':');
-    counters.perMinute.set(tsMinute, (counters.perMinute.get(tsMinute) || 0) + 1);
+    const minuteBucket = iso.slice(0, 16); // "YYYY-MM-DDTHH:MM"
+    counters.perMinute.set(minuteBucket, (counters.perMinute.get(minuteBucket) || 0) + 1);
 
-    // add parsed event to batch buffer
+    // buffer event for batch write
     counters.eventsBatch.push({
-      ts: rawTs, ip, method, path, status, bytes
+      ts: iso,     // IMPORTANT: ISO timestamp (store.insertEvents uses this for eventTs)
+      ip,
+      method,
+      path,
+      status,
+      bytes
     });
 
-    // once buffer reaches 1000 events, flush to store
     if (counters.eventsBatch.length >= 1000) {
       await store.insertEvents(jobId, counters.eventsBatch);
       counters.eventsBatch = [];
     }
   }
 
-  // flush any remaining events in the buffer
+  // flush remaining
   if (counters.eventsBatch.length > 0) {
     await store.insertEvents(jobId, counters.eventsBatch);
     counters.eventsBatch = [];
   }
 
-  // finalize SHA256 digest of the whole file
   const digest = sha.digest('hex');
 
-  // prepare summary object with all the stats we gathered
   const summary = {
     totalLines: counters.total,
     sha256: digest,
@@ -82,17 +123,8 @@ async function analyzeLogFile(filePath, jobId, store) {
       .map(([minute, count]) => ({ minute, count }))
   };
 
-  // save summary and mark job as finished
   await store.saveSummary(jobId, summary);
   await store.finishJob(jobId);
-}
-
-// helper to grab the top N items from a frequency map
-function topN(obj, n) {
-  return Object.entries(obj)
-    .sort((a,b)=>b[1]-a[1])
-    .slice(0,n)
-    .map(([key,count])=>({ key, count }));
 }
 
 module.exports = { analyzeLogFile };

@@ -4,9 +4,11 @@ const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 
 const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
-const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
-const { DynamoDBDocumentClient, PutCommand, GetCommand, QueryCommand, DeleteCommand, BatchWriteCommand } = require('@aws-sdk/lib-dynamodb');
+const {
+  DynamoDBDocumentClient, PutCommand, GetCommand, QueryCommand,
+  DeleteCommand, BatchWriteCommand, ScanCommand
+} = require('@aws-sdk/lib-dynamodb');
 const { SSMClient, GetParameterCommand } = require('@aws-sdk/client-ssm');
 
 const REGION = process.env.AWS_REGION || 'ap-southeast-2';
@@ -14,7 +16,7 @@ const s3 = new S3Client({ region: REGION });
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }));
 const ssm = new SSMClient({ region: REGION });
 
-// Load config from Parameter Store (with env fallbacks)
+// Resolve config from env or Parameter Store (env wins)
 async function cfg() {
   async function readParam(name, fallback) {
     try {
@@ -33,24 +35,21 @@ async function cfg() {
   };
 }
 
-// --- Logs ---
+/* ---------------- Logs ---------------- */
 
 async function saveLogFile(owner, multerFile) {
   const { BUCKET, DDB_LOGS } = await cfg();
   const id = uuidv4();
   const key = `logs/${id}.log`;
 
-  // compute sha256
   const sha256 = await fileSha256(multerFile.path);
 
-  // upload to S3
   await s3.send(new PutObjectCommand({
     Bucket: BUCKET,
     Key: key,
     Body: fs.createReadStream(multerFile.path)
   }));
 
-  // record metadata
   await ddb.send(new PutCommand({
     TableName: DDB_LOGS,
     Item: {
@@ -67,13 +66,46 @@ async function saveLogFile(owner, multerFile) {
   return id;
 }
 
+// Called by /logs/register-upload after browser PUT to S3
+async function registerUploadedMetadata(owner, { logId, key, filename, size }) {
+  const { DDB_LOGS } = await cfg();
+
+  // Upsert simple metadata row; analyzer can fill details later
+  await ddb.send(new PutCommand({
+    TableName: DDB_LOGS,
+    Item: {
+      logId,
+      owner,
+      filename,
+      bytes: size || null,
+      s3Key: key,
+      uploadedAt: new Date().toISOString()
+    }
+  }));
+
+  return logId;
+}
+
 async function getLog(logId) {
   const { DDB_LOGS } = await cfg();
   const res = await ddb.send(new GetCommand({ TableName: DDB_LOGS, Key: { logId } }));
   return res.Item || null;
 }
 
-// Download to /tmp for analyzer (returns local path)
+// List logs (optionally filter by owner)
+async function listLogs(owner = null, limit = 100) {
+  const { DDB_LOGS } = await cfg();
+  const params = { TableName: DDB_LOGS, Limit: limit };
+  if (owner) {
+    params.FilterExpression = '#o = :owner';
+    params.ExpressionAttributeNames = { '#o': 'owner' };
+    params.ExpressionAttributeValues = { ':owner': owner };
+  }
+  const res = await ddb.send(new ScanCommand(params));
+  return res.Items || [];
+}
+
+// Download from S3 to /tmp for analyzer
 async function ensureLocalLogCopy(logId) {
   const { BUCKET } = await cfg();
   const m = await getLog(logId);
@@ -87,7 +119,7 @@ async function ensureLocalLogCopy(logId) {
   return dest;
 }
 
-// --- Jobs ---
+/* ---------------- Jobs ---------------- */
 
 async function createJob(logId) {
   const { DDB_JOBS } = await cfg();
@@ -99,34 +131,44 @@ async function createJob(logId) {
 
 async function startJob(jobId) {
   const { DDB_JOBS } = await cfg();
-  await ddb.send(new PutCommand({ TableName: DDB_JOBS, Item: { jobId, status: 'running', startedAt: new Date().toISOString() }, ConditionExpression: 'attribute_exists(jobId)' }));
+  await ddb.send(new PutCommand({
+    TableName: DDB_JOBS,
+    Item: { jobId, status: 'running', startedAt: new Date().toISOString() },
+    ConditionExpression: 'attribute_exists(jobId)'
+  }));
 }
 
 async function finishJob(jobId) {
   const { DDB_JOBS } = await cfg();
-  await ddb.send(new PutCommand({ TableName: DDB_JOBS, Item: { jobId, status: 'done', finishedAt: new Date().toISOString() }, ConditionExpression: 'attribute_exists(jobId)' }));
+  await ddb.send(new PutCommand({
+    TableName: DDB_JOBS,
+    Item: { jobId, status: 'done', finishedAt: new Date().toISOString() },
+    ConditionExpression: 'attribute_exists(jobId)'
+  }));
 }
 
 async function failJob(jobId, message) {
   const { DDB_JOBS } = await cfg();
-  await ddb.send(new PutCommand({ TableName: DDB_JOBS, Item: { jobId, status: 'error', error: message, finishedAt: new Date().toISOString() } }));
+  await ddb.send(new PutCommand({
+    TableName: DDB_JOBS,
+    Item: { jobId, status: 'error', error: message, finishedAt: new Date().toISOString() }
+  }));
 }
 
-// --- Events & summaries ---
+/* --------- Events & Summaries --------- */
 
 async function insertEvents(jobId, events) {
-  // resolve job -> logId
   const { DDB_JOBS, DDB_EVENTS } = await cfg();
   const jres = await ddb.send(new GetCommand({ TableName: DDB_JOBS, Key: { jobId } }));
   if (!jres.Item) throw new Error('Job not found');
   const logId = jres.Item.logId;
 
-  // Batch write (25 at a time)
-  const chunks = chunk(events.map((e, i) => ({
+  // Batch write (25 at a time). Ensure each event has ISO ts at e.ts
+  const chunks = chunk(events.map(e => ({
     PutRequest: {
       Item: {
         logId,
-        eventTs: e.ts,   // ISO timestamp as sort key
+        eventTs: e.ts, // ISO timestamp as RANGE key
         ...e
       }
     }
@@ -159,7 +201,6 @@ async function queryEvents(logId, opts) {
   const { DDB_EVENTS } = await cfg();
   const { page = 1, limit = 100, ip = null, status = null, timeFrom = null, timeTo = null, sort = 'eventTs' } = opts;
 
-  // Time range query via KeyCondition on (logId, eventTs)
   const KeyConditionExpression = ['logId = :id'];
   const ExpressionAttributeValues = { ':id': logId };
   if (timeFrom && timeTo) {
@@ -174,7 +215,6 @@ async function queryEvents(logId, opts) {
     ExpressionAttributeValues[':to'] = timeTo;
   }
 
-  // Pull up to page * limit and then slice (simple)
   const need = page * limit;
   let items = [], lastKey = undefined;
 
@@ -183,7 +223,7 @@ async function queryEvents(logId, opts) {
       TableName: DDB_EVENTS,
       KeyConditionExpression: KeyConditionExpression.join(' AND '),
       ExpressionAttributeValues,
-      ScanIndexForward: !String(sort).startsWith('-'),  // asc by default; desc if sort = -eventTs
+      ScanIndexForward: !String(sort).startsWith('-'), // asc unless sort starts with '-'
       ExclusiveStartKey: lastKey
     }));
     items = items.concat(res.Items || []);
@@ -191,7 +231,6 @@ async function queryEvents(logId, opts) {
     if (!lastKey) break;
   }
 
-  // Filter (ip/status) client-side
   if (ip) items = items.filter(e => e.ip === ip);
   if (status !== null) items = items.filter(e => e.status === status);
 
@@ -210,7 +249,7 @@ async function deleteLog(logId) {
   }
   await ddb.send(new DeleteCommand({ TableName: DDB_SUMMARIES, Key: { logId } }));
 
-  // delete events (scan per logId; here we query all and batch delete)
+  // delete all events for this log
   const res = await ddb.send(new QueryCommand({
     TableName: DDB_EVENTS,
     KeyConditionExpression: 'logId = :id',
@@ -224,7 +263,7 @@ async function deleteLog(logId) {
   }
 }
 
-// --- Helpers ---
+/* --------------- Helpers --------------- */
 
 function fileSha256(filePath) {
   return new Promise((resolve, reject) => {
@@ -235,6 +274,7 @@ function fileSha256(filePath) {
     s.on('error', reject);
   });
 }
+
 function streamToFile(stream, dest) {
   return new Promise((resolve, reject) => {
     const w = fs.createWriteStream(dest);
@@ -243,6 +283,7 @@ function streamToFile(stream, dest) {
     w.on('error', reject);
   });
 }
+
 function chunk(arr, n) {
   const out = [];
   for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
@@ -252,5 +293,7 @@ function chunk(arr, n) {
 module.exports = {
   saveLogFile, getLog, ensureLocalLogCopy,
   createJob, startJob, finishJob, failJob,
-  insertEvents, saveSummary, getSummary, queryEvents, deleteLog
+  insertEvents, saveSummary, getSummary, queryEvents, deleteLog,
+  listLogs,                       // NEW
+  registerUploadedMetadata        // NEW
 };

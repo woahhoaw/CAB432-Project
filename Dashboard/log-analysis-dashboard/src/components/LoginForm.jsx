@@ -4,8 +4,8 @@ import { setToken } from "../api";
 const region = "ap-southeast-2";
 const userPoolId = "ap-southeast-2_IxQ2VwGbl"; // from your pool
 const clientId = "7ethk777ah5lg6lk7qsfur4go5";
-const domain = `${userPoolId}.auth.${region}.amazoncognito.com`; // or your custom domain
-const redirectUri = window.location.origin; // http://localhost:5173 for dev
+const domain = "ap-southeast-2ixq2vwgbl.auth.ap-southeast-2.amazoncognito.com";
+const redirectUri = window.location.origin; // e.g. http://localhost:5173
 
 export default function LoginForm({ onLogin }) {
   // Parse token from redirect

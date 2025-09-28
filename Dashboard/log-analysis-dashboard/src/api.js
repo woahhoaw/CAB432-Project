@@ -1,4 +1,4 @@
-const API_BASE = "http://3.27.201.109:3000";
+const API_BASE = "http://3.26.7.52:3000";
 
 export function setToken(token) {
   localStorage.setItem("token", token);

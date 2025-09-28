@@ -10,65 +10,84 @@ const { analyzeLogFile } = require('./analyzer');
 const store = require('./store');
 
 const app = express();
-app.use(cors());
+app.use(cors());                
 app.use(express.json());
 
-
+// Initialize Cognito (verifier cache)
 initCognito({ userPoolId: process.env.COGNITO_USERPOOL_ID }).catch(console.error);
 
+// Healthcheck (handy for quick pings)
+app.get('/health', (_req, res) => res.json({ ok: true }));
 
 // Keep multer so legacy /logs/upload still works if you want:
 const upload = multer({ dest: path.join('/tmp', 'uploads') });
 
-// --- Pre-signed upload (Additional: S3 Pre-signed URLs) ---
+// --- Pre-signed upload (S3) ---
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const s3 = new S3Client({ region: process.env.AWS_REGION || 'ap-southeast-2' });
 
+// Get a pre-signed PUT URL for S3
 app.get('/logs/upload-url', authMiddleware, async (_req, res) => {
-  const BUCKET = process.env.S3_BUCKET;
-  const logId = require('uuid').v4();
-  const key = `logs/${logId}.log`;
-  const url = await getSignedUrl(s3, new PutObjectCommand({ Bucket: BUCKET, Key: key }), { expiresIn: 3600 });
-  res.json({ logId, key, url });
-});
+  try {
+    const BUCKET = process.env.S3_BUCKET;
+    if (!BUCKET) return res.status(500).json({ message: 'S3_BUCKET not set' });
 
-// After client PUTs to S3, register metadata + compute SHA
-app.post('/logs/register-upload', authMiddleware, async (req, res) => {
-  const { logId, key, filename, size } = req.body || {};
-  if (!logId || !key || !filename) return res.status(400).json({ message: 'Missing fields' });
-
-
-
-  //call saveLogFile-like logic: we didn't upload file here; instead write a Logs record now:
-  const logMeta = await store.getLog(logId);
-  if (!logMeta) {
-    // create a Logs record referencing S3 key (sha computed later by analyzer or a background step)
-    await require('@aws-sdk/lib-dynamodb').DynamoDBDocumentClient.from(
-      new (require('@aws-sdk/client-dynamodb').DynamoDBClient)({ region: process.env.AWS_REGION || 'ap-southeast-2' })
-    ).send(new (require('@aws-sdk/lib-dynamodb').PutCommand)({
-      TableName: process.env.DDB_LOGS || 'Logs',
-      Item: {
-        logId, owner: req.user.sub, filename, bytes: size || null, s3Key: key, uploadedAt: new Date().toISOString()
-      }
-    }));
+    const logId = require('uuid').v4();
+    const key = `logs/${logId}.log`;
+    const url = await getSignedUrl(
+      s3,
+      new PutObjectCommand({ Bucket: BUCKET, Key: key }),
+      { expiresIn: 3600 }
+    );
+    res.json({ logId, key, url });
+  } catch (err) {
+    console.error('GET /logs/upload-url error', err);
+    res.status(500).json({ message: 'Failed to create upload URL' });
   }
-  res.json({ ok: true, logId });
 });
 
-// --- Legacy upload still works  ---
+// After client PUTs to S3, register metadata
+app.post('/logs/register-upload', authMiddleware, async (req, res) => {
+  try {
+    const { logId, key, filename, size } = req.body || {};
+    if (!logId || !key || !filename) {
+      return res.status(400).json({ message: 'Missing fields: logId/key/filename' });
+    }
+
+    // If it’s already present, this is idempotent (store side upserts).
+    await store.registerUploadedMetadata(req.user.sub, { logId, key, filename, size });
+    res.json({ ok: true, logId });
+  } catch (err) {
+    console.error('POST /logs/register-upload error', err);
+    res.status(500).json({ message: 'Register failed' });
+  }
+});
+
+// Legacy file upload to server 
 app.post('/logs/upload', authMiddleware, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
     const logId = await store.saveLogFile(req.user.sub, req.file);
     res.json({ logId });
   } catch (err) {
-    console.error(err);
+    console.error('POST /logs/upload error', err);
     res.status(500).json({ message: 'Upload failed' });
   }
 });
 
-// --- Analyze log ---
+// List logs for current user (used by MyLogs.jsx)
+app.get('/logs', authMiddleware, async (req, res) => {
+  try {
+    const items = await store.listLogs(req.user.sub, 100);
+    res.json(items);
+  } catch (err) {
+    console.error('GET /logs error', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Kick off analysis for a specific logId
 app.post('/logs/:logId/analyze', authMiddleware, async (req, res) => {
   try {
     const { logId } = req.params;
@@ -76,52 +95,65 @@ app.post('/logs/:logId/analyze', authMiddleware, async (req, res) => {
     if (!log) return res.status(404).json({ message: 'Log not found' });
 
     const job = await store.createJob(logId);
+
+    // Perform analysis in the background
     (async () => {
       try {
-        const localPath = await store.ensureLocalLogCopy(logId);  // NEW: download from S3
-        await analyzeLogFile(localPath, job.jobId, store);
+        await store.startJob(job.jobId);
+        const localPath = await store.ensureLocalLogCopy(logId);
+        await analyzeLogFile(localPath, job.jobId, store); // analyzer should call insertEvents/saveSummary/finishJob
       } catch (e) {
+        console.error('analyze error', e);
         await store.failJob(job.jobId, e.message);
-        return;
       }
     })();
 
     res.json({ jobId: job.jobId, status: 'queued' });
   } catch (err) {
-    console.error(err);
+    console.error('POST /logs/:logId/analyze error', err);
     res.status(500).json({ message: 'Analyze failed' });
   }
 });
 
-// --- Get summary ---
+// Get summary for a logId (used by SummaryView.jsx)
 app.get('/logs/:logId/summary', authMiddleware, async (req, res) => {
-  const s = await store.getSummary(req.params.logId);
-  if (!s) return res.status(404).json({ message: 'No summary for this log' });
-  res.json(s);
+  try {
+    const s = await store.getSummary(req.params.logId);
+    if (!s) return res.status(404).json({ message: 'No summary for this log' });
+    res.json(s);
+  } catch (err) {
+    console.error('GET /logs/:logId/summary error', err);
+    res.status(500).json({ message: 'Error reading summary' });
+  }
 });
 
-// --- Get events ---
+// Get events for a logId (pagination/filters)
 app.get('/logs/:logId/events', authMiddleware, async (req, res) => {
   const { page = 1, limit = 100, ip, status, from, to, sort } = req.query;
   try {
     const result = await store.queryEvents(req.params.logId, {
-      page: Number(page), limit: Number(limit), ip: ip || null,
-      status: status ? Number(status) : null, timeFrom: from || null, timeTo: to || null, sort: sort || 'eventTs'
+      page: Number(page),
+      limit: Number(limit),
+      ip: ip || null,
+      status: status ? Number(status) : null,
+      timeFrom: from || null,
+      timeTo: to || null,
+      sort: sort || 'eventTs'
     });
     res.json(result);
   } catch (err) {
-    console.error(err);
+    console.error('GET /logs/:logId/events error', err);
     res.status(500).json({ message: 'Error reading events' });
   }
 });
 
-// --- Delete log ---
+// Delete a log (admin only)
 app.delete('/logs/:logId', authMiddleware, requireRole('admin'), async (req, res) => {
   try {
     await store.deleteLog(req.params.logId);
     res.json({ ok: true });
   } catch (err) {
-    console.error(err);
+    console.error('DELETE /logs/:logId error', err);
     res.status(500).json({ message: 'Delete failed' });
   }
 });
