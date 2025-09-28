@@ -155,8 +155,8 @@ async function failJob(jobId, message) {
   await ddb.send(new UpdateCommand({
     TableName: DDB_JOBS,
     Key: { jobId },
-    UpdateExpression: 'SET #st = :st, error = :msg, finishedAt = :t',
-    ExpressionAttributeNames: { '#st': 'status' },
+    UpdateExpression: 'SET #st = :st, #err = :msg, finishedAt = :t',
+    ExpressionAttributeNames: { '#st': 'status', '#err': 'error' },
     ExpressionAttributeValues: {
       ':st': 'error',
       ':msg': String(message || ''),
@@ -193,26 +193,29 @@ async function insertEvents(jobId, events) {
   const { DDB_JOBS, DDB_EVENTS } = await cfg();
   const { GetCommand, BatchWriteCommand } = require('@aws-sdk/lib-dynamodb');
 
-  // Resolve logId from job (logId must be present; we use UpdateCommand for status transitions now)
+  // Resolve logId from job
   const jres = await ddb.send(new GetCommand({ TableName: DDB_JOBS, Key: { jobId } }));
   if (!jres.Item || !jres.Item.logId) throw new Error('Job not found or missing logId on job');
   const logId = jres.Item.logId;
 
   // De-dup same-second timestamps by adding incremental milliseconds
-  const perSecondCounts = new Map(); // baseSecond -> count
+  const perSecondCounts = new Map(); // baseSecondISO -> count
 
   function uniqueIso(tsIso) {
-    // tsIso is a full ISO string (UTC), e.g. 2025-08-27T12:00:01.000Z
-    // Use the second portion as the key (strip milliseconds)
-    const baseSecond = tsIso.replace(/\.\d{3}Z$/, '.000Z');
+    // Parse whatever ISO we get; normalize to the *base second* at .000Z
+    const dBase = new Date(tsIso);
+    if (isNaN(dBase)) return tsIso; // fallback: just use as-is
+    dBase.setUTCMilliseconds(0);
+    const baseSecond = dBase.toISOString(); // e.g. 2025-08-27T12:00:01.000Z
+
     const c = perSecondCounts.get(baseSecond) || 0;
     perSecondCounts.set(baseSecond, c + 1);
-    if (c === 0) {
-      return baseSecond; // first occurrence stays .000Z
-    }
-    // add c ms to base
+
+    if (c === 0) return baseSecond;
+
+    // Add c ms to keep sort order but ensure uniqueness
     const d = new Date(baseSecond);
-    d.setUTMilliseconds(d.getUTCMilliseconds() + c);
+    d.setUTCMilliseconds(c);
     return d.toISOString();
   }
 
@@ -228,8 +231,8 @@ async function insertEvents(jobId, events) {
     requests.push({
       PutRequest: {
         Item: {
-          logId,          // PK
-          eventTs: uniqueTs, // SK (now unique even when many events in same second)
+          logId,             // PK
+          eventTs: uniqueTs, // SK (unique within the second)
           ip: e.ip,
           method: e.method,
           path: e.path,
