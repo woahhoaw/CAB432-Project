@@ -24,11 +24,11 @@ async function cfg() {
     }
   }
   return {
-    BUCKET: process.env.S3_BUCKET || await readParam('/loganalyzer/S3_BUCKET', ''),
-    DDB_LOGS: process.env.DDB_LOGS || await readParam('/loganalyzer/DDB_LOGS', 'Logs'),
-    DDB_SUMMARIES: process.env.DDB_SUMMARIES || await readParam('/loganalyzer/DDB_SUMMARIES', 'LogSummaries'),
-    DDB_EVENTS: process.env.DDB_EVENTS || await readParam('/loganalyzer/DDB_EVENTS', 'LogEvents'),
-    DDB_JOBS: process.env.DDB_JOBS || await readParam('/loganalyzer/DDB_JOBS', 'Jobs'),
+    BUCKET: process.env.S3_BUCKET || await readParam('/n11603674-log-analysis/S3_BUCKET', ''),
+    DDB_LOGS: process.env.DDB_LOGS || await readParam('/n11603674-log-analysis/DDB_LOGS', 'Logs-n11603674'),
+    DDB_SUMMARIES: process.env.DDB_SUMMARIES || await readParam('/n11603674-log-analysis/DDB_SUMMARIES', 'LogSummaries-n11603674'),
+    DDB_EVENTS: process.env.DDB_EVENTS || await readParam('/n11603674-log-analysis/DDB_EVENTS', 'LogEvents-n11603674'),
+    DDB_JOBS: process.env.DDB_JOBS || await readParam('/n11603674-log-analysis/DDB_JOBS', 'Jobs-n11603674'),
   };
 }
 
