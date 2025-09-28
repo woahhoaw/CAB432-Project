@@ -47,6 +47,29 @@ app.get('/logs/upload-url', authMiddleware, async (_req, res) => {
   }
 });
 
+// --- Pre-signed download (GET) of the original log file ---
+app.get('/logs/:logId/download-url', authMiddleware, async (req, res) => {
+  try {
+    const { logId } = req.params;
+    const log = await store.getLog(logId);
+    if (!log?.s3Key) return res.status(404).json({ message: 'Log not found' });
+
+    const BUCKET = (await (async () => {
+      const c = await store.__cfg?.() || {};
+      return c.BUCKET || process.env.S3_BUCKET;
+    })());
+    const url = await getSignedUrl(
+      s3,
+      new GetObjectCommand({ Bucket: BUCKET, Key: log.s3Key }),
+      { expiresIn: 3600 } // 1 hour
+    );
+    res.json({ logId, url });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ message: 'Failed to create download URL' });
+  }
+});
+
 // After client PUTs to S3, register metadata + auto-analyze
 app.post('/logs/register-upload', authMiddleware, async (req, res) => {
   try {

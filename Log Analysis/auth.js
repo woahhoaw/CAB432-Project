@@ -103,18 +103,11 @@ async function authMiddleware(req, res, next) {
 }
 
 function requireRole(role) {
-  // For Cognito, role can come from groups or custom claims; adjust as needed.
   return (req, res, next) => {
-    // Example checks:
-    // - Cognito groups in `cognito:groups`
-    // - Custom claim `custom:role`
-    // - Local dev token { role: 'admin' }
-    const u = req.user || {};
-    const groups = u['cognito:groups'] || [];
-    const customRole = u['custom:role'] || u.role;
-
-    const isAllowed = customRole === role || (Array.isArray(groups) && groups.includes(role));
-    if (!isAllowed) return res.status(403).json({ message: 'Forbidden' });
+    const groups = req.user['cognito:groups'] || [];
+    if (!groups.includes(role)) {
+      return res.status(403).json({ message: 'Forbidden: requires ' + role });
+    }
     next();
   };
 }

@@ -6,7 +6,17 @@ import MyLogs from "./components/MyLogs";
 import { getToken, clearToken } from "./api";
 import "./App.css";
 
-localStorage.removeItem("token");
+
+const COGNITO_DOMAIN =
+  "https://ap-southeast-2ixq2vwgbl.auth.ap-southeast-2.amazoncognito.com"; // ✅ your Hosted UI domain
+const CLIENT_ID = "7ethk777ah5lg6lk7qsfur4go5";
+// Update these if your domain/client changes
+const LOGOUT_REDIRECT = window.location.origin;
+
+const COGNITO_LOGOUT_URL =
+  `${COGNITO_DOMAIN}/logout` +
+  `?client_id=${CLIENT_ID}` +
+  `&logout_uri=${encodeURIComponent(LOGOUT_REDIRECT)}`;
 
 export default function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(!!getToken());
@@ -14,14 +24,17 @@ export default function App() {
   const [page, setPage] = useState("upload"); // upload | summary | mylogs
 
   function handleLogout() {
+    // Clear local app state + token
     clearToken();
     setIsLoggedIn(false);
     setLogId(null);
     setPage("upload");
+    // Redirect through Cognito so its cookies/sessions are cleared too
+    window.location.href = COGNITO_LOGOUT_URL;
   }
 
   if (!isLoggedIn) {
-    return <LoginForm onLogin={() => setIsLoggedIn(true)} />;
+    return <LoginForm onLogin={() => { setIsLoggedIn(true); setPage("upload"); }} />;
   }
 
   return (
@@ -57,7 +70,14 @@ export default function App() {
           />
         )}
         {page === "summary" && logId && <SummaryView logId={logId} />}
-        {page === "mylogs" && <MyLogs onSelectLog={(id) => { setLogId(id); setPage("summary"); }} />}
+        {page === "mylogs" && (
+          <MyLogs
+            onSelectLog={(id) => {
+              setLogId(id);
+              setPage("summary");
+            }}
+          />
+        )}
       </main>
     </div>
   );
