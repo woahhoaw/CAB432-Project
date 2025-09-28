@@ -184,17 +184,24 @@ async function insertEvents(jobId, events) {
   if (!jres.Item) throw new Error('Job not found');
   const logId = jres.Item.logId;
 
-  // Batch write (25 at a time). Ensure each event has ISO ts at e.ts
-  const chunks = chunk(events.map(e => ({
-    PutRequest: {
-      Item: {
-        logId,
-        eventTs: e.ts, // ISO timestamp as RANGE key
-        ...e
+  // Build PutRequests with eventId (SK) = ts#seq
+  let seq = 0;
+  const requests = events.map((e) => {
+    const eventId = `${e.ts}#${String(seq++).padStart(6, '0')}`; // e.ts is ISO
+    return {
+      PutRequest: {
+        Item: {
+          logId,           // PK
+          eventId,         // SK (matches table schema)
+          eventTs: e.ts,   // keep original ISO as attribute
+          ...e             // ip, method, path, status, bytes
+        }
       }
-    }
-  })), 25);
+    };
+  });
 
+  // BatchWrite in chunks of 25
+  const chunks = chunk(requests, 25);
   for (const batch of chunks) {
     await ddb.send(new BatchWriteCommand({ RequestItems: { [DDB_EVENTS]: batch } }));
   }
@@ -220,31 +227,25 @@ async function getSummary(logId) {
 
 async function queryEvents(logId, opts) {
   const { DDB_EVENTS } = await cfg();
-  const { page = 1, limit = 100, ip = null, status = null, timeFrom = null, timeTo = null, sort = 'eventTs' } = opts;
+  const { page = 1, limit = 100, ip = null, status = null, timeFrom = null, timeTo = null, sort = 'eventId' } = opts;
 
-  const KeyConditionExpression = ['logId = :id'];
-  const ExpressionAttributeValues = { ':id': logId };
-  if (timeFrom && timeTo) {
-    KeyConditionExpression.push('eventTs BETWEEN :from AND :to');
-    ExpressionAttributeValues[':from'] = timeFrom;
-    ExpressionAttributeValues[':to'] = timeTo;
-  } else if (timeFrom) {
-    KeyConditionExpression.push('eventTs >= :from');
-    ExpressionAttributeValues[':from'] = timeFrom;
-  } else if (timeTo) {
-    KeyConditionExpression.push('eventTs <= :to');
-    ExpressionAttributeValues[':to'] = timeTo;
-  }
+  // Build SK range on eventId using ISO ranges
+  // We suffix '#' to make room for "#000000" sequence; use '\uffff' to cap the upper bound.
+  const startId = (timeFrom ? `${timeFrom}#` : '0000-00-00T00:00:00.000Z#');
+  const endId   = (timeTo   ? `${timeTo}#\uffff` : '9999-12-31T23:59:59.999Z#\uffff');
+
+  const KeyConditionExpression = 'logId = :id AND eventId BETWEEN :start AND :end';
+  const ExpressionAttributeValues = { ':id': logId, ':start': startId, ':end': endId };
 
   const need = page * limit;
-  let items = [], lastKey = undefined;
+  let items = [], lastKey;
 
   while (items.length < need) {
     const res = await ddb.send(new QueryCommand({
       TableName: DDB_EVENTS,
-      KeyConditionExpression: KeyConditionExpression.join(' AND '),
+      KeyConditionExpression,
       ExpressionAttributeValues,
-      ScanIndexForward: !String(sort).startsWith('-'), // asc unless sort starts with '-'
+      ScanIndexForward: !String(sort).startsWith('-'), // asc by default
       ExclusiveStartKey: lastKey
     }));
     items = items.concat(res.Items || []);
@@ -252,6 +253,7 @@ async function queryEvents(logId, opts) {
     if (!lastKey) break;
   }
 
+  // Optional filters
   if (ip) items = items.filter(e => e.ip === ip);
   if (status !== null) items = items.filter(e => e.status === status);
 
